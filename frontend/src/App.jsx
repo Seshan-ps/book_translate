@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { UploadCloud, FileType, CheckCircle, Download, BookOpen, Hexagon, Image as ImageIcon, Loader2 } from 'lucide-react';
 import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
 import './App.css';
 
 function App() {
@@ -150,7 +149,28 @@ ${isHex ? `<div class="hex-dump">\n${safeContent}\n</div>` : `<div>\n${safeConte
     }
 
     const blob = await zip.generateAsync({ type: "blob" });
-    saveAs(blob, `${data.filename.replace('.pdf', '')}_export.zip`);
+    const fileName = data.filename && typeof data.filename === 'string' 
+      ? data.filename.replace(/\.pdf$/i, '') 
+      : 'document';
+    
+    // Create a File object instead of a raw Blob to enforce the filename on the object itself
+    const file = new File([blob], `${fileName}_export.zip`, { type: "application/zip" });
+    
+    const url = window.URL.createObjectURL(file);
+    const link = document.createElement('a');
+    link.style.display = 'none';
+    link.href = url;
+    link.setAttribute('download', `${fileName}_export.zip`);
+    document.body.appendChild(link);
+    
+    // Small delay to ensure the DOM updates before clicking
+    setTimeout(() => {
+      link.click();
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      }, 100);
+    }, 0);
   };
 
   return (

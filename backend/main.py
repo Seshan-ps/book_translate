@@ -20,14 +20,113 @@ app.add_middleware(
 def string_to_hex(s: str) -> str:
     return s.encode('utf-8').hex()
 
-def get_html_from_page(page) -> str:
-    # get_text("html") produces an exact visual replica of the source PDF using absolute-positioned CSS
-    raw_html = page.get_text("html")
-    # PyMuPDF outputs standard HTML5 without self-closing un-paired tags like img or br.
-    # To satisfy strict XHTML parsers in browsers for the .xhtml files, we automatically self-close them.
-    raw_html = re.sub(r'<img([^>]*?)(?<!/)>', r'<img\1/>', raw_html)
-    raw_html = re.sub(r'<br([^>]*?)(?<!/)>', r'<br\1/>', raw_html)
-    return raw_html
+def get_html_from_page(page, page_num: int, images_list: list) -> str:
+    # Use detailed dictionary extraction to access font sizes and styles
+    blocks = page.get_text("dict")["blocks"]
+    
+    # Pre-calculate margins from text blocks
+    text_blocks = [b for b in blocks if b["type"] == 0]
+    left_margin = 9999
+    for b in text_blocks:
+        for l in b.get("lines", []):
+            for s in l.get("spans", []):
+                if s["text"].strip() and s["bbox"][0] < left_margin:
+                    left_margin = s["bbox"][0]
+    if left_margin == 9999:
+        left_margin = 0
+            
+    # Sort blocks approximately top-to-bottom, left-to-right
+    blocks = sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+    
+    in_list = False
+    html_content = ""
+    
+    for b in blocks:
+        if b["type"] == 0: # text
+            text = ""
+            max_font_size = 0
+            is_bold = False
+            first_char_x = 9999
+            
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    span_text = span.get("text", "")
+                    if not span_text.strip() and not text:
+                        continue
+                    text += span_text
+                    font_sz = span.get("size", 0)
+                    if font_sz > max_font_size:
+                        max_font_size = font_sz
+                    flags = span.get("flags", 0)
+                    # Simple heuristic: bold flag in PyMuPDF is 2^4
+                    if "Bold" in span.get("font", "") or (flags & 16):
+                        is_bold = True
+                    if first_char_x == 9999:
+                        first_char_x = span["bbox"][0]
+            
+            text = text.strip()
+            if not text:
+                continue
+                
+            x0 = first_char_x
+            is_indented = (x0 - left_margin) > 15
+            class_name = "indent" if is_indented else "noindent"
+            escaped_text = html.escape(text)
+            
+            # Simple content heuristic mapping to the specific classes requested by the user:
+            
+            # Very large fonts -> h1 chapter title
+            if max_font_size > 18:
+                if in_list: html_content += '</ul>\n'; in_list = False
+                html_content += f'<header>\n<h1 class="h1c">{escaped_text}</h1>\n</header>\n'
+                continue
+                
+            # Headers -> h2
+            if max_font_size > 13 and is_bold:
+                if in_list: html_content += '</ul>\n'; in_list = False
+                html_content += f'<h2 class="content-area">{escaped_text}</h2>\n'
+                continue
+                
+            # Bullets
+            if text.startswith('•') or text.startswith('-'):
+                if not in_list:
+                    html_content += '<ul class="bullet">\n'
+                    in_list = True
+                cleaned = escaped_text.lstrip('•-').strip()
+                html_content += f'<li class="bullt">{cleaned}</li>\n'
+                continue
+            
+            if in_list:
+                html_content += '</ul>\n'
+                in_list = False
+                
+            html_content += f'<p class="{class_name}">{escaped_text}</p>\n'
+            
+        elif b["type"] == 1: # image
+            bbox = fitz.Rect(b["bbox"])
+            if bbox.width > 20 and bbox.height > 20:
+                try:
+                    pix = page.get_pixmap(clip=bbox, dpi=300)
+                    image_bytes = pix.tobytes("png")
+                    img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+                    img_idx = len(images_list) + 1
+                    
+                    images_list.append({
+                        "page": page_num,
+                        "idx": img_idx,
+                        "ext": "png",
+                        "data": img_b64
+                    })
+                    
+                    # Inject standard XHTML <img> tag referencing the export path wrapped in a section/figure
+                    html_content += f'<section class="center">\n<img alt="image" src="../images/image_page{page_num}_{img_idx}.png"/>\n</section>\n'
+                except Exception:
+                    pass
+                    
+    if in_list:
+        html_content += '</ul>\n'
+        
+    return html_content
 
 @app.post("/upload/")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -44,6 +143,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     
     # If no TOC, we will treat each page as a chapter, or the whole thing as one chapter.
     chapters = []
+    images = []
     if toc:
         for i, item in enumerate(toc):
             level, title, page_num = item
@@ -57,7 +157,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             for p in range(start_page, end_page):
                 if p < doc.page_count:
                     page = doc.load_page(p)
-                    chapter_text += get_html_from_page(page)
+                    chapter_text += get_html_from_page(page, p + 1, images)
                 
             chapters.append({
                 "title": title,
@@ -67,39 +167,14 @@ async def upload_pdf(file: UploadFile = File(...)):
     else:
         # Fallback if no logical chapters exist
         full_text = ""
-        for page in doc:
-            full_text += get_html_from_page(page)
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            full_text += get_html_from_page(page, i + 1, images)
         chapters.append({
             "title": "Document Content",
             "text": full_text,
             "hex": string_to_hex(full_text)
         })
-
-    # Extract all images, charts, and vector graphics
-    images = []
-    for i in range(doc.page_count):
-        page = doc.load_page(i)
-        
-        # Layout analysis: type 1 blocks identify visual components (images, charts, graphs)
-        blocks = page.get_text("blocks")
-        img_blocks = [b for b in blocks if b[6] == 1]
-        
-        for img_index, b in enumerate(img_blocks):
-            bbox = fitz.Rect(b[:4])
-            # Filter out tiny insignificant artifact blocks
-            if bbox.width > 20 and bbox.height > 20:
-                try:
-                    # Render the chart/image area from the page at 300 DPI for high quality
-                    pix = page.get_pixmap(clip=bbox, dpi=300)
-                    image_bytes = pix.tobytes("png")
-                    img_b64 = base64.b64encode(image_bytes).decode('utf-8')
-                    images.append({
-                        "page": i + 1,
-                        "ext": "png",
-                        "data": img_b64
-                    })
-                except Exception:
-                    pass
                     
     doc.close()
     
